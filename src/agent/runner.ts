@@ -235,6 +235,34 @@ interface Turn {
  * Splitting on turn boundaries — instead of slicing by raw message count —
  * prevents orphaned `tool_use_id` references that the Anthropic and OpenAI
  * APIs reject. Modelled on `groupIntoTurns` from the context-chef library.
+ *
+ * 将扁平的消息数组按原子轮次（atomic turns）分组，以便上下文管理策略能够在安全的边界上切分。
+ *
+ * 一个“轮次”（turn）的定义：
+ *   - 单条 user 或 assistant 的纯文本消息；或
+ *   - 一条包含一个或多个 `tool_use` 块的 assistant 消息，紧接着的
+ *     一条包含对应 `tool_result` 块的 user 消息（两者作为一个整体，不可拆分）。
+ *
+ * 为什么需要这样做？
+ *   - 如果直接按消息数量或 token 数量截断，可能会在 `tool_use` 和它的 `tool_result`
+ *     之间切开，导致 `tool_use_id` 无法匹配。
+ *   - Anthropic / OpenAI API 要求成对出现：`tool_use` 必须后跟匹配的 `tool_result`，
+ *     否则请求会被拒绝。
+ *   - 按轮次分组后，可以安全地从头部或尾部丢弃完整的轮次，而不会产生孤立的 `tool_use`。
+ *
+ * 实现参考了 `context-chef` 库的 `groupIntoTurns` 方法。
+ *
+ * @param messages 扁平的消息数组（包含 user / assistant 交替的角色）
+ * @returns Turn 数组，每个 Turn 包含起始和结束索引（startIndex 包含，endIndex 不包含）
+ *
+ * @example
+ * 输入：
+ *   [user, assistant(有tool_use), user(有tool_result), assistant, user]
+ * 输出：
+ *   Turn1: {start:0, end:1}         // 第一条 user
+ *   Turn2: {start:1, end:3}         // assistant(tool_use) + user(tool_result)
+ *   Turn3: {start:3, end:4}         // assistant
+ *   Turn4: {start:4, end:5}         // user
  */
 function groupIntoTurns(messages: LLMMessage[]): Turn[] {
   const turns: Turn[] = []
@@ -276,6 +304,33 @@ function groupIntoTurns(messages: LLMMessage[]): Turn[] {
  * The placeholder still tells the summariser that media was present at this
  * turn, so the produced summary can reference it. Modelled on chef Janitor's
  * `stripAttachmentsForCompression`.
+ *
+ *
+ * 问题背景：
+ *   - `summarizeMessages` 方法在压缩长对话时，会将旧消息序列化为 JSON 字符串作为提示的一部分，
+ *     然后发送给摘要模型（另一个 LLM）。
+ *   - 如果原始消息中包含 `image` 块（通常携带 base64 编码的图片数据），`JSON.stringify`
+ *     会将其完整序列化，导致一个 1MB 的图片变成大约 250k tokens 的 base64 字符串。
+ *   - 这会导致几个问题：
+ *       1) 摘要调用的 token 消耗巨大，违背了“压缩”的初衷（节省 token）。
+ *       2) 极有可能超出摘要模型的最大上下文窗口（context limit）。
+ *       3) 摘要模型并不需要看到图片的原始像素数据，只需要知道“这里有一张图片”。
+ *
+ * 解决方案：
+ *   - 在构造摘要提示之前，遍历所有消息，将 `image` 块替换为简单的文本占位符，
+ *     格式为 `[image: {media_type}]`（例如 `[image: image/jpeg]`）。
+ *   - 这样摘要模型仍然知道该轮对话中有图片内容，可以据此生成合理的摘要，
+ *     但不会消耗大量 token 去编码二进制数据。
+ *
+ * 设计参考：
+ *   - 该函数模仿了 `context-chef` 库（chef Janitor）中的 `stripAttachmentsForCompression` 方法。
+ *
+ * 注意：
+ *   - 该替换只影响传给摘要模型的消息，不会修改保存在 `conversationMessages` 中的原始消息。
+ *   - 只处理 `type === 'image'` 的块，其他类型的块（text, tool_use, tool_result 等）保持不变。
+ *
+ * @param messages 原始 LLM 消息数组（可能包含 ImageBlock）
+ * @returns 新消息数组，其中所有 ImageBlock 已被替换为文本占位符
  */
 function stripImageBlocksForSummary(messages: LLMMessage[]): LLMMessage[] {
   return messages.map((msg) => {
@@ -308,6 +363,16 @@ const DEFAULT_MIN_COMPRESS_CHARS = 500
  * consecutive `user` turns (Bedrock) and summaries do not concatenate onto
  * the original user prompt (direct API). If there is no user message yet,
  * inserts a single assistant text preamble.
+ *
+ * 使用场景：
+ *   - 当使用摘要压缩策略时，压缩后的新消息需要插入类似 `[Conversation summary] ...` 的前缀，
+ *     但绝不能直接拼接到原始的第一条用户消息（例如用户原始问题）上，因为那样会污染原始 prompt。
+ *   - 对于某些 LLM API（如 Bedrock），连续两条 user 消息是不允许的。通过将前缀插入到第一条 user
+ *     消息的开头（而非增加单独一条 user），维持了 user/assistant 交替规则。
+ *
+ * @param messages 原始消息数组（可能以 user 或 assistant 开头）
+ * @param prefix   要插入的文本前缀（例如摘要内容）
+ * @returns 修改后的消息数组
  */
 function prependSyntheticPrefixToFirstUser(
   messages: LLMMessage[],
@@ -364,7 +429,15 @@ export class AgentRunner {
   private serializeMessage(message: LLMMessage): string {
     return JSON.stringify(message)
   }
-
+  /**
+   * 使用滑动窗口策略截断消息历史，保留最近的 N 轮完整对话（原子轮次），
+   * 同时确保不会拆分 `tool_use` / `tool_result` 对。
+   *
+   * @param messages 原始消息数组
+   * @param maxTurns 要保留的最大轮次数（每个轮次通常包含一条 assistant 和一条 user 消息，
+   *                 但 tool 轮次会包含 assistant(tool_use) + user(tool_result) 两条）
+   * @returns 截断后的消息数组，可能包含一个说明前缀（如果丢弃了历史）
+   */
   private truncateToSlidingWindow(messages: LLMMessage[], maxTurns: number): LLMMessage[] {
     if (maxTurns <= 0) {
       return messages
@@ -416,7 +489,27 @@ export class AgentRunner {
     result.push(...kept)
     return result
   }
-
+  /**
+   * 使用 LLM 对对话历史中较旧的部分生成摘要，然后用摘要替换旧部分，
+   * 从而实现上下文压缩（适用于长对话场景）。
+   *
+   * 核心流程：
+   *   1. 检查是否需要压缩（预估 token 数 > maxTokens 且消息数量 >= 4）。
+   *   2. 保留第一条 user 消息（通常是用户原始输入），将剩余消息分为“旧部分”和“最近部分”。
+   *      - 分界点选择在偶数边界（保证不会拆散 tool_use / tool_result 对）。
+   *   3. 对旧部分移除图片块（避免 base64 炸裂），并生成签名用于缓存。
+   *   4. 如果缓存命中，直接复用之前的摘要前缀；否则调用 LLM 生成摘要。
+   *   5. 将摘要前缀通过 `prependSyntheticPrefixToFirstUser` 安全地注入到“最近部分”的第一条 user 消息开头。
+   *   6. 返回新的消息列表（第一条 user 消息 + 注入摘要后的最近部分），以及摘要调用消耗的 token 用量。
+   *
+   * @param messages         原始消息数组（完整对话历史）
+   * @param maxTokens        压缩阈值（预估 token 数超过此值才触发压缩）
+   * @param summaryModel     用于生成摘要的模型名称（未指定时使用主模型）
+   * @param baseChatOptions  基础 LLM 调用选项（将复制并覆盖 model，同时清除 tools）
+   * @param turns            当前轮次编号（仅用于 trace 事件）
+   * @param options          运行时选项（包含 trace 回调等）
+   * @returns 压缩后的消息数组及本次摘要调用消耗的 token（若无压缩则 usage 为零）
+   */
   private async summarizeMessages(
     messages: LLMMessage[],
     maxTokens: number,
@@ -522,6 +615,19 @@ export class AgentRunner {
     }
   }
 
+  /**
+   * 根据配置的上下文策略（滑动窗口 / 摘要 / 紧凑压缩 / 自定义）压缩消息数组。
+   * 该方法在主循环中每轮 LLM 调用之前被调用，用于将对话历史控制在 token 预算内。
+   *
+   * @param messages        原始消息数组（完整的对话历史）
+   * @param strategy        上下文策略配置对象
+   * @param baseChatOptions 基础 LLM 选项（用于摘要策略，因为摘要需要调用 LLM）
+   * @param turns           当前轮次编号（仅用于追踪事件）
+   * @param options         运行时选项（包含 trace 回调等）
+   * @returns 压缩后的消息数组及本次压缩消耗的 token（注意：只有摘要策略会消耗 token，
+   *          其他策略的 `usage` 均为零；自定义策略当前返回零，但可扩展）
+   * @throws 如果自定义策略的 `compress` 函数返回空数组或非数组，抛出错误
+   */
   private async applyContextStrategy(
     messages: LLMMessage[],
     strategy: ContextStrategy,
@@ -529,10 +635,29 @@ export class AgentRunner {
     turns: number,
     options: RunOptions,
   ): Promise<{ messages: LLMMessage[]; usage: TokenUsage }> {
+    // --------------------------------------------------------------------------
+    // 策略一：滑动窗口（sliding-window）
+    // --------------------------------------------------------------------------
+    // 特点：
+    //   - 不调用 LLM，极快且无 token 消耗
+    //   - 保留第一条 user 消息 + 最近的 N 个原子轮次（根据 groupIntoTurns 分组）
+    //   - 丢弃的轮次会在第一条 user 消息后添加一条说明 `[Earlier conversation history truncated — X turn(s) removed]`
+    //   - 保证不会拆分 tool_use / tool_result 对
     if (strategy.type === 'sliding-window') {
-      return { messages: this.truncateToSlidingWindow(messages, strategy.maxTurns), usage: ZERO_USAGE }
+      return {
+        messages: this.truncateToSlidingWindow(messages, strategy.maxTurns),
+        usage: ZERO_USAGE,
+      }
     }
 
+    // --------------------------------------------------------------------------
+    // 策略二：摘要（summarize）
+    // --------------------------------------------------------------------------
+    // 特点：
+    //   - 调用 LLM（使用 `summaryModel` 或主模型）对较旧的部分生成摘要
+    //   - 保留第一条 user 消息 + 最近的一部分消息，在最近部分前面注入摘要前缀
+    //   - 摘要结果会缓存（基于旧消息的签名），相同签名直接复用缓存，避免重复调用 LLM
+    //   - 返回的 `usage` 包含摘要调用消耗的 token（包括输入和输出）
     if (strategy.type === 'summarize') {
       return this.summarizeMessages(
         messages,
@@ -544,10 +669,29 @@ export class AgentRunner {
       )
     }
 
+    // --------------------------------------------------------------------------
+    // 策略三：紧凑压缩（compact）
+    // --------------------------------------------------------------------------
+    // 特点：
+    //   - 不调用 LLM，纯启发式规则，无 token 消耗
+    //   - 压缩长文本块、长 tool_result 内容，保留 tool_use 块和最近 N 轮完整消息
+    //   - 对错误结果、委托结果（delegate_to_agent）不压缩
+    //   - 返回的 `usage` 始终为零
     if (strategy.type === 'compact') {
-      return { messages: this.compactMessages(messages, strategy), usage: ZERO_USAGE }
+      return {
+        messages: this.compactMessages(messages, strategy),
+        usage: ZERO_USAGE,
+      }
     }
 
+    // --------------------------------------------------------------------------
+    // 策略四：自定义（custom）
+    // --------------------------------------------------------------------------
+    // 特点：
+    //   - 用户提供 `compress(messages, estimatedTokens)` 函数
+    //   - 框架仅要求返回非空的 LLMMessage[]，并检查合法性
+    //   - 压缩过程可能消耗 token（例如调用外部服务），但返回值中的 `usage` 固定为零，
+    //     因为框架无法获知自定义压缩的内部消耗。如果需要记录，用户应自行通过 `onTrace` 上报。
     const estimated = estimateTokens(messages)
     const compressed = await strategy.compress(messages, estimated)
     if (!Array.isArray(compressed) || compressed.length === 0) {
@@ -881,6 +1025,30 @@ export class AgentRunner {
 
         // Announce each tool-use block the model requested (after loop
         // detection, so terminate mode never emits unpaired events).
+        // ------------------------------------------------------------------
+        // 将本轮 LLM 请求的所有工具调用块逐个发布给调用方（流式事件）
+        // ------------------------------------------------------------------
+        // 为什么要放在循环检测 **之后**？
+        // 
+        // 1. 循环检测可能决定立即终止（action === 'terminate'）
+        //    - 如果在此之前就已经 yield 了 tool_use 事件，调用方会收到“工具请求”
+        //    - 但由于循环立即 break，后续的 tool_result 永远不会 yield
+        //    - 这会导致调用方看到孤立的 tool_use 事件，没有对应的 tool_result
+        //    - 这种“未配对”的事件会破坏调用方对执行流程的预期，也可能导致 UI 显示异常
+        //
+        // 2. 通过将 yield 放在循环检测 **之后**：
+        //    - 如果 action === 'terminate'，代码会直接 break 跳出循环，根本不会走到这个 for 循环
+        //    - 因此调用方永远不会收到那些将要被丢弃的 tool_use 事件
+        //    - 保证了事件流的完整性：要么 tool_use 和 tool_result 成对出现，要么都不出现
+        //
+        // 3. 对于 action === 'inject' 或 'warn'（第一次警告）：
+        //    - 循环检测不终止，代码会继续执行到这里
+        //    - 正常 yield tool_use 事件，稍后也会 yield tool_result 事件（包括注入的警告文本）
+        //    - 事件对保持完整
+        //
+        // 4. 对于 action === 'continue'：
+        //    - 同样正常执行，不影响事件配对
+        //
         for (const block of toolUseBlocks) {
           yield { type: 'tool_use', data: block } satisfies StreamEvent
         }
@@ -1012,6 +1180,42 @@ export class AgentRunner {
         // and the tool_result user message has been appended, so stream
         // consumers see matched tool_use/tool_result pairs and the returned
         // `messages` remain resumable against the Anthropic/OpenAI APIs.
+        // ------------------------------------------------------------------
+        // Budget check (phase 2) – deferred until after tool_result handling
+        // ------------------------------------------------------------------
+        //
+        // 为什么需要延迟到这里才最终决定是否终止？
+        //
+        // 第一阶段的预算检查（在 LLM 响应后、工具执行前）发现超限时，只设置了
+        // `pendingBudgetExceeded = true`，但并未立即 `break`。原因是：
+        //   - 此时还未 yield tool_use 事件，也未执行工具、未产生 tool_result
+        //   - 如果立即终止，调用方会看到不完整的执行痕迹：既没有完整的 tool_use，
+        //     也没有对应的 tool_result，违反了“事件成对出现”的约定。
+        //   - 更重要的是，`conversationMessages` 历史会停留在包含未匹配 tool_use 的
+        //     assistant 消息上，而缺乏对应的 tool_result user 消息。这样的历史记录
+        //     后续无法重新提交给 Anthropic/OpenAI API（会报 400 错误）。
+        //
+        // 因此框架承诺：**无论是否超限，只要本轮产生了 tool_use，就一定会在终止前
+        //   执行工具、生成 tool_result、并将其作为 user 消息追加到历史中**。
+        //   这保证了即使预算超限，最终返回的 `messages` 数组也始终是 API 可接受的
+        //   完整对话（tool_use 与 tool_result 配对完整）。
+        //
+        // 下面两个检查分别处理两种超限场景：
+
+        // ------------------------------------------------------------------
+        // 场景 A：第一阶段超限（LLM 调用后立即发现超出预算）
+        // ------------------------------------------------------------------
+        // `pendingBudgetExceeded` 在第一阶段被设置为 true。此时：
+        //   - 工具已经执行完毕
+        //   - tool_result 事件已 yield
+        //   - tool_result user 消息已追加到 conversationMessages
+        // 历史已经是完整的。现在可以安全退出，不必继续下一轮循环。
+        // ------------------------------------------------------------------
+        // 场景 B：因本轮产生的委托调用（子 Agent）导致超限
+        // ------------------------------------------------------------------
+        // 有些工具（例如 delegate_to_agent）会在执行过程中调用子 Agent，并产生额外的
+        // token 消耗。这些消耗在工具执行完成后才通过 `ex.delegationUsage` 汇总到
+        // `totalUsage` 中。因此即使第一阶段没有超限，加上委托 token 后可能超限。
         if (pendingBudgetExceeded) {
           break
         }
@@ -1077,6 +1281,33 @@ export class AgentRunner {
    * - Long assistant text blocks are truncated with an excerpt
    * - Error tool_results are never compressed
    * - Recent turns (within `preserveRecentTurns`) are kept intact
+   *
+   * 基于规则的选择性上下文压缩（无 LLM 调用）
+   *
+   * 当对话消息的预估 token 数超过 `strategy.maxTokens` 时，该方法对旧消息进行启发式压缩，
+   * 同时保留关键的决策信息（tool_use 块），减少 token 消耗。
+   *
+   * 压缩原则：
+   * - `tool_use` 块（代表 agent 的决策/行动意图）始终保留，不压缩
+   * - 过长的 assistant 文本块被截断并添加省略标记
+   * - 过长的 `tool_result` 内容被替换为紧凑的摘要标记（除非是错误结果或委托结果）
+   * - 最近的 N 轮（`preserveRecentTurns`）保持完整不压缩
+   * - 第一条 user 消息始终原样保留（通常包含用户原始问题/系统提示）
+   * - 错误结果（`is_error: true`）绝不压缩
+   * - `delegate_to_agent` 的结果也保留原样（父 agent 可能需要从中提取子 agent 的输出）
+   * 
+   * 
+   * 原始消息: [firstUser] [oldTurn1] [oldTurn2] ... [recentTurns...]
+   *        ↓
+   *  1. 找出第一条 user 消息 (永久保留)
+   *  2. 从尾部向前保留最近 preserveRecentTurns 轮完整对话（assistant+user 对）
+   *  3. 对中间区域的消息进行压缩：
+   *    - assistant: 保留 tool_use，截断长文本，[Image compacted]
+   *    - user: 保留短 tool_result 和错误/委托结果，将长结果改为标记
+   *  4. 返回压缩后的数组，可能完全未变（anyChanged = false）
+   * @param messages 原始消息数组
+   * @param strategy 压缩策略配置（type: 'compact'）
+   * @returns 压缩后的消息数组（如果没有实际压缩则返回原数组）
    */
   private compactMessages(
     messages: LLMMessage[],
@@ -1206,7 +1437,21 @@ export class AgentRunner {
    * with tool results is always kept intact — the LLM is about to see it.
    *
    * Error results and results shorter than `minChars` are never compressed.
-   */
+   *
+    * --------------------------------------------------------------------------
+    * 目的：在每轮循环开始前，将那些“已经被 LLM 看过的”长 tool_result 替换为简短标记，
+    *       从而减少后续消息的 token 占用。
+    *
+    * 判断“已消费”的逻辑：
+    *   - 假设对话序列为：... user(tool_result) → assistant(响应) → ...
+    *   - 当 assistant 已经在 tool_result 之后生成了响应，那么这条 tool_result 就算“已消费”。
+    *   - 最后一条带有 tool_result 的 user 消息（正准备喂给 LLM 的）**不被压缩**，
+    *     因为 LLM 还没有机会看到它。
+    *   - 该函数会在每一轮循环（除第一轮外）的开始时被调用，此时 conversationMessages
+    *     中已经包含了上一轮追加的 assistant（可能带 tool_use）和 user(tool_result)，
+    *     而最新的 user(tool_result) 正是 LLM 将在本轮看到的消息，所以它被排除在压缩之外。
+    * --------------------------------------------------------------------------
+    * */
   private compressConsumedToolResults(messages: LLMMessage[]): LLMMessage[] {
     const config = this.options.compressToolResults
     if (!config) return messages
@@ -1285,6 +1530,51 @@ export class AgentRunner {
   /**
    * Build the {@link ToolUseContext} passed to every tool execution.
    * Identifies this runner as the invoking agent.
+   */
+  /**
+   * --------------------------------------------------------------------------
+   * 构建工具执行上下文对象
+   * --------------------------------------------------------------------------
+   *
+   * 该方法的职责是创建 ToolUseContext 对象，该对象会在每个工具被调用时作为
+   * 执行环境的一部分传递给工具。工具可以使用这个上下文来了解：
+   *   - 是哪个 Agent 发起了本次调用（agent 信息）
+   *   - 是否应该提前终止（abortSignal）
+   *   - 当前是否在多 Agent 协作环境中（team 信息）
+   *
+   * 为什么需要这个上下文？
+   *   - 有些工具需要知道调用者的身份，例如 delegate_to_agent 工具需要知道
+   *     当前 Agent 的名称和模型，以便正确委派子任务。
+   *   - 支持可取消的长时运行工具：abortSignal 允许工具在外部取消时提前退出。
+   *   - 支持团队协作场景：team 信息可以让工具知道兄弟 Agent 的存在，从而实现
+   *     路由或信息共享。
+   *
+   * 返回值结构 ToolUseContext：
+   *   - agent: 当前 Agent 的身份描述
+   *       - name: Agent 显示名称（默认为 'runner'）
+   *       - role: 角色描述（默认为 'assistant'，可用于系统提示中的身份说明）
+   *       - model: 当前使用的 LLM 模型标识（例如 'claude-opus-4-6'）
+   *   - abortSignal: 可选的 AbortSignal，工具执行时可检查是否已中止
+   *   - team: 可选的团队信息，包含团队成员列表、当前 Agent 在团队中的角色等。
+   *           仅在 Orchestrator 运行 Team 时才会注入。
+   *
+   * 优先级规则：
+   *   - abortSignal 优先使用 RunOptions 中传入的，若未提供则回退到 RunnerOptions
+   *     中的静态 abortSignal。这使得调用方可以为单次运行设置独立的超时控制。
+   *   - team 信息只在调用方显式传递时才会出现在上下文中，保证非团队场景下
+   *     工具不会意外依赖团队信息。
+   *
+   * 使用场景示例：
+   *   1. 文件读写工具：可以检查 abortSignal，在外部取消时停止读取大文件。
+   *   2. delegate_to_agent 工具：读取 agent.name 和 agent.model，决定委派给
+   *      哪个子 Agent 以及使用什么模型配置。
+   *   3. 日志工具：记录是哪个 Agent 发起了调用，便于调试。
+   *
+   * 注意：
+   *   - 该方法是私有方法，仅供 AgentRunner 内部使用，在每次并行执行工具前调用。
+   *   - 返回的对象是浅拷贝（直接使用 options 中的引用），工具不应修改此对象，
+   *     但可以安全地读取其属性。
+   * --------------------------------------------------------------------------
    */
   private buildToolContext(options: RunOptions = {}): ToolUseContext {
     return {

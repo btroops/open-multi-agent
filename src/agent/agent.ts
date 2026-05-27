@@ -320,7 +320,8 @@ export class Agent {
     const agentStartMs = Date.now()
 
     try {
-      // --- beforeRun hook ---
+      // --- beforeRun hook --- 
+      // 疑惑：我不是很明白为什么会有这个hook，这是用在什么场景吗？？
       if (this.config.beforeRun) {
         const hookCtx = this.buildBeforeRunHookContext(messages)
         const modified = await this.config.beforeRun(hookCtx)
@@ -328,6 +329,8 @@ export class Agent {
       }
 
       const runner = await this.getRunner()
+      // 这只是一个回调函数，用于在每次收到LLM消息时更新agent的状态，并且调用外部传入的onMessage回调（如果有的话）。
+      // 这样做的目的是为了让agent能够实时地处理和响应LLM生成的消息，同时也允许外部代码通过onMessage回调来监听这些消息并进行相应的处理。
       const internalOnMessage = (msg: LLMMessage) => {
         this.state.messages.push(msg)
         callerOptions?.onMessage?.(msg)
