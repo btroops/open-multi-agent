@@ -470,4 +470,32 @@ describe('Agent hooks — beforeRun / afterRun', () => {
     expect(beforeSpy.mock.calls[0]![0].prompt).toBe('turn 1')
     expect(beforeSpy.mock.calls[1]![0].prompt).toBe('turn 2')
   })
+
+  // -----------------------------------------------------------------------
+  //  prompt() with RunOptions hooks
+  // -----------------------------------------------------------------------
+  it('prompt() with RunOptions hooks', async () => {
+    const onToolCallSpy = vi.fn()
+    const onToolResultSpy = vi.fn()
+    const onMessageSpy = vi.fn()
+
+    const config: AgentConfig = {
+      ...baseConfig,
+      beforeRun: (ctx) => ctx,
+      afterRun: (result) => result,
+    }
+    const { agent } = buildMockAgent(config, 'ok')
+
+    await agent.prompt('test', {
+      onToolCall: onToolCallSpy,
+      onToolResult: onToolResultSpy,
+      onMessage: onMessageSpy,
+    })
+
+    expect(onToolCallSpy).toHaveBeenCalledTimes(0) // No tools in this test
+    expect(onToolResultSpy).toHaveBeenCalledTimes(0)
+    expect(onMessageSpy).toHaveBeenCalledTimes(1) //  Only assistant response; user message pushed before executeRun
+    expect(onMessageSpy.mock.calls[0]![0].role).toBe('assistant')
+  })
+
 })

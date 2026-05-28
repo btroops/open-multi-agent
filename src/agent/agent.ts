@@ -219,7 +219,7 @@ export class Agent {
    * Use this for multi-turn interactions.
    */
   // TODO(#18): accept optional RunOptions to forward trace context
-  async prompt(message: string): Promise<AgentRunResult> {
+  async prompt(message: string, runOptions?: Partial<RunOptions>): Promise<AgentRunResult> {
     const userMessage: LLMMessage = {
       role: 'user',
       content: [{ type: 'text', text: message }],
@@ -227,7 +227,7 @@ export class Agent {
 
     this.messageHistory.push(userMessage)
 
-    const result = await this.executeRun([...this.messageHistory])
+    const result = await this.executeRun([...this.messageHistory], runOptions)
 
     // Persist the new messages into history so the next `prompt` sees them.
     for (const msg of result.messages) {
