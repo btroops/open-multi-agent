@@ -771,109 +771,153 @@ export interface OrchestratorConfig {
   readonly onProgress?: (event: OrchestratorEvent) => void
   readonly onTrace?: (event: TraceEvent) => void | Promise<void>
   /**
-   * Optional approval gate called between task execution rounds.
+   * 【分批执行审批回调】可选的人工审批关卡
+   * 触发时机：每一批任务执行完成后、下一批任务开始前
    *
-   * After a batch of tasks completes, this callback receives all
-   * completed {@link Task}s from that round and the list of tasks about
-   * to start next. Return `true` to continue or `false` to abort —
-   * remaining tasks will be marked `'skipped'`.
+   * 作用：
+   * 1. 收到本轮【已完成的所有任务】
+   * 2. 收到下一轮【即将执行的任务】
+   * 3. 你返回 true → 继续执行
+   * 4. 你返回 false → 终止执行，剩余任务全部标记为 skipped
    *
-   * Not called when:
-   * - No tasks succeeded in the round (all failed).
-   * - No pending tasks remain after the round (final batch).
+   * 不会触发的情况：
+   * - 本轮任务全部失败（没有成功完成的任务）
+   * - 本轮之后没有待执行任务（已是最后一批）
    *
-   * **Note:** Do not mutate the {@link Task} objects passed to this
-   * callback — they are live references to queue state. Mutation is
-   * undefined behavior.
+   * 重要注意：
+   * 不要修改传入的 Task 对象！
+   * 它们是队列状态的真实引用，修改会导致系统行为异常。
+   *
+   * @param completedTasks 本轮已完成的任务
+   * @param nextTasks 下一轮准备执行的任务
    */
   readonly onApproval?: (completedTasks: readonly Task[], nextTasks: readonly Task[]) => Promise<boolean>
   /**
-   * Optional approval gate called once after the coordinator decomposes the
-   * goal into tasks and before execution begins.
+   * 【任务计划审批回调】可选的人工审批关卡
+   * 触发时机：Coordinator 把目标拆解成任务后 → 【执行任务之前】
    *
-   * Receives the full plan as a {@link Task} array. Return `true` to proceed
-   * or `false` to abort. A thrown callback is treated as an abort.
+   * 功能：
+   * 1. 接收完整的任务计划（所有 Task 数组）
+   * 2. 你可以查看、确认、拒绝
+   * 3. return true → 继续执行
+   * 4. return false / 抛错 → 终止执行
    *
-   * Only invoked by `runTeam()`. `runAgent()` and `runTasks()` are
-   * unaffected. The `TeamRunResult` returned on abort still reflects the
-   * coordinator's decomposition tokens.
+   * 重要规则：
+   * - 仅 runTeam() 会触发
+   * - runAgent() / runTasks() 不触发
+   * - 即使终止执行，拆解任务消耗的 Token 仍会被统计
+   * - 禁止修改传入的 Task 对象（会直接改变队列状态，引发异常）
    *
-   * **Note:** Do not mutate the {@link Task} objects passed to this
-   * callback. They are live references to queue state; mutation is
-   * undefined behavior.
+   * @param tasks 协调者生成的完整任务计划（只读）
+   * @returns 允许执行返回 true，拒绝返回 false
    */
   readonly onPlanReady?: (tasks: readonly Task[]) => Promise<boolean>
   /**
-   * Called for each streaming event emitted by an agent during runTeam().
-   * When provided, agents run in streaming mode so the TUI can receive
-   * real-time text deltas and tool-call events.
-   * Only invoked by runTeam(). Not called for runAgent() or runTasks().
+   * 【实时流式回调】在 runTeam() 执行期间，当任意智能体产生流式事件时触发
+   * 
+   * 作用：
+   * 1. 只要传入了这个回调，所有智能体会自动进入【流式执行模式】
+   * 2. 前端 / TUI 终端可以实时接收：文字增量、令牌流、工具调用事件
+   * 3. 仅用于自动编排流程（runTeam）
+   * 
+   * 重要：
+   * - 只有 runTeam() 会触发
+   * - runAgent() / runTasks() 不会触发
+   * - 专门给终端界面（TUI）做实时展示用
+   * 
+   * @param agentName - 产生事件的智能体名称
+   * @param event - 流式事件（文字片段、完成、错误、工具调用）
    */
   readonly onAgentStream?: (agentName: string, event: StreamEvent) => void
 }
 
 /**
- * Optional overrides for the temporary coordinator agent created by `runTeam`.
+ * 【协调者配置】runTeam() 创建临时协调智能体时的可选覆盖配置
  *
- * All fields are optional. Unset fields fall back to orchestrator defaults
- * (or coordinator built-in defaults where applicable).
+ * 所有字段都是可选的，不设置则使用默认值
+ * 用于自定义「任务拆解 + 结果汇总」的那个AI大脑
  */
 export interface CoordinatorConfig {
-  /** Coordinator model. Defaults to `OrchestratorConfig.defaultModel`. */
+  /** 协调者使用的模型（如 gpt-4o / claude 3），默认取 Orchestrator 默认模型 */
   readonly model?: string
+
   /**
-   * Optional {@link LLMAdapter} for the coordinator agent. When set, coordinator
-   * LLM calls use this adapter and ignore `provider` / `apiKey` / `baseURL`.
+   * 自定义 LLM 适配器
+   * 如果设置，协调者会忽略 provider/apiKey/baseURL，直接用这个适配器
    */
   readonly adapter?: LLMAdapter
+
+  /** LLM 提供商（openai / anthropic / 自定义） */
   readonly provider?: SupportedProvider
+
+  /** API 地址 */
   readonly baseURL?: string
+
+  /** API 密钥 */
   readonly apiKey?: string
+
   /**
-   * Full system prompt override. When set, this replaces the default
-   * coordinator preamble and decomposition guidance.
-   *
-   * Team roster, output format, and synthesis sections are still appended.
+   * 【高级】完全自定义系统提示词
+   * 设置后，会替换默认的协调者提示词
+   * 但团队名册、输出格式、汇总规则仍然会自动追加
    */
   readonly systemPrompt?: string
+
   /**
-   * Additional instructions appended to the default coordinator prompt.
-   * Ignored when `systemPrompt` is provided.
+   * 给协调者追加额外指令
+   * 如果设置了 systemPrompt，则此字段无效
    */
   readonly instructions?: string
+
+  /** 最大回合数（协调者思考/工具调用次数） */
   readonly maxTurns?: number
+
+  /** 最大输出 Token */
   readonly maxTokens?: number
+
+  /** 温度（随机性） */
   readonly temperature?: number
-  /** See {@link AgentConfig.frequencyPenalty}. */
+
+  /** 频率惩罚（减少重复） */
   readonly frequencyPenalty?: number
-  /** See {@link AgentConfig.presencePenalty}. */
+
+  /** 存在惩罚（减少重复） */
   readonly presencePenalty?: number
-  /** See {@link AgentConfig.topP}. */
+
+  /** 核采样参数 */
   readonly topP?: number
-  /** See {@link AgentConfig.topK}. */
+
+  /** 最高 K 采样 */
   readonly topK?: number
-  /** See {@link AgentConfig.minP}. */
+
+  /** 最小 P 采样 */
   readonly minP?: number
-  /** See {@link AgentConfig.parallelToolCalls}. */
+
+  /** 是否允许并行工具调用 */
   readonly parallelToolCalls?: boolean
+
   /**
-   * Adapter-specific escape hatch merged into the outgoing request payload.
-   * Spread between the sampling params and the structural fields, so values
-   * here can override the standard sampling defaults (`temperature`, `topP`,
-   * etc.) but cannot override transport-level fields (`model`, `messages`,
-   * `tools`, `stream`, and Anthropic's `system`).
+   * 适配器专属的额外请求体
+   * 可覆盖标准参数（temperature、topP 等）
+   * 不能覆盖 model、messages、tools、stream 等核心字段
    */
   readonly extraBody?: Record<string, unknown>
-  /** Predefined tool preset for common coordinator use cases. */
+
+  /** 工具预设：readonly / readwrite / full（控制协调者能使用哪些工具） */
   readonly toolPreset?: 'readonly' | 'readwrite' | 'full'
-  /** Tool names available to the coordinator. */
+
+  /** 允许协调者使用的工具名称列表 */
   readonly tools?: readonly string[]
-  /** Tool names explicitly denied to the coordinator. */
+
+  /** 明确禁止协调者使用的工具 */
   readonly disallowedTools?: readonly string[]
+
+  /** 循环检测配置（防止无限思考） */
   readonly loopDetection?: LoopDetectionConfig
+
+  /** 超时时间（毫秒） */
   readonly timeoutMs?: number
 }
-
 // ---------------------------------------------------------------------------
 // Trace events — lightweight observability spans
 // ---------------------------------------------------------------------------

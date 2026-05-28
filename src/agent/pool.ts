@@ -139,40 +139,51 @@ export class AgentPool {
   // -------------------------------------------------------------------------
 
   /**
-   * Run a single prompt on the named agent, respecting the pool concurrency
-   * limit.
+   * 在指定名称的智能体上执行一次提示词
+   * 严格遵守并发池的并发限制（同一时间最多跑 N 个任务）
    *
-   * @throws {Error} If the agent name is not found.
+   * @throws 找不到对应智能体时抛出错误
    */
   async run(
-    agentName: string,
-    prompt: string,
-    runOptions?: Partial<RunOptions>,
-    streamCallback?: (event: StreamEvent) => void,
+    agentName: string,        // 要执行的智能体名称
+    prompt: string,           // 要执行的提示词
+    runOptions?: Partial<RunOptions>, // 运行选项（追踪、中止信号、工具等）
+    streamCallback?: (event: StreamEvent) => void, // 流式回调
   ): Promise<AgentRunResult> {
+    // 获取智能体实例，不存在则直接抛出异常
     const agent = this.requireAgent(agentName)
+    // 获取该智能体的【独占锁】：保证同一个Agent同一时间只跑一个任务（防止并发冲突）
     const agentLock = this.agentLocks.get(agentName)!
 
-    // Acquire per-agent lock first so the second call for the same agent waits
-    // here without consuming a pool slot.  Then acquire the pool semaphore.
+    // ==================== 第一层锁：Agent 独占锁 ====================
+    // 作用：同一个Agent，不能同时执行多个任务
     await agentLock.acquire()
     try {
+      // ==================== 第二层锁：全局并发信号量 ====================
+      // 作用：控制整个团队的最大并发数（比如最多同时跑5个Agent）
       await this.semaphore.acquire()
       try {
+        // ==================== 模式A：流式执行（有回调） ====================
         if (streamCallback) {
           let result: AgentRunResult | null = null
+
+          // 遍历流式事件
           for await (const event of agent.stream(prompt, runOptions)) {
             try {
+              // 转发流式事件给外层（UI实时输出）
               streamCallback(event)
             } catch {
-              // Streaming callback must not affect execution; mirrors the
-              // observability contract of `emitTrace`. A throwing callback
-              // here would otherwise be caught by `executeWithRetry` and
-              // burn another LLM call on every retry until exhausted.
+              // 关键：流式回调抛错不影响任务执行
+              // 防止因为前端/日志报错，导致LLM任务中断、重试
             }
+
+            // 流结束 → 拿到最终结果
             if (event.type === 'done') result = event.data as AgentRunResult
+            // 流报错 → 抛出异常
             if (event.type === 'error') throw event.data as Error
           }
+
+          // 返回最终结果（兜底）
           return result ?? {
             success: false,
             output: '',
@@ -181,15 +192,19 @@ export class AgentPool {
             toolCalls: [],
           }
         }
+
+        // ==================== 模式B：普通阻塞执行（无回调） ====================
         return await agent.run(prompt, runOptions)
+
       } finally {
+        // 释放全局并发锁
         this.semaphore.release()
       }
     } finally {
+      // 释放Agent独占锁
       agentLock.release()
     }
   }
-
   /**
    * Run a prompt on a caller-supplied Agent instance, acquiring only the pool
    * semaphore — no per-agent lock, no registry lookup.
