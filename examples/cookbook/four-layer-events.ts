@@ -143,18 +143,20 @@ function demonstrateTaskQueueEvents(): void {
 // 4. 编排层事件处理器
 // ============================================================================
 
+// 收集 taskId → title 映射，方便 task_complete 输出可读标题
+const taskTitles = new Map<string, string>()
+
 function handleProgress(event: OrchestratorEvent): void {
   switch (event.type) {
     case 'task_start': {
       const task = event.data as Task | undefined
+      if (task) taskTitles.set(event.task ?? '', task.title)
       log('orchestrator', 'task_start', `"${task?.title ?? event.task}" → ${event.agent}`)
       break
     }
-    case 'task_complete': {
-      const task = event.data as Task | undefined
-      log('orchestrator', 'task_complete', `"${task?.title ?? event.task}" ← ${event.agent}`)
+    case 'task_complete':
+      log('orchestrator', 'task_complete', `"${taskTitles.get(event.task ?? '') ?? event.task}" ← ${event.agent}`)
       break
-    }
     case 'agent_start':
       log('orchestrator', 'agent_start', `${event.agent}`)
       break
