@@ -1031,17 +1031,20 @@ export interface MemoryEntry {
 }
 
 /**
- * Persistent (or in-memory) key-value store shared across agents.
- * Implementations may be backed by Redis, SQLite, or plain objects.
+ * 可供所有智能体共享的持久化（或内存型）键值存储。
+ * 底层实现可以基于 Redis、SQLite 或普通对象。
  */
 export interface MemoryStore {
+  // 根据 key 获取一条共享数据
   get(key: string): Promise<MemoryEntry | null>
+
+  // 保存一条数据（value 是字符串，可附加元数据）
   set(key: string, value: string, metadata?: Record<string, unknown>): Promise<void>
+
   /**
-   * Optional: write an entry with a turn-count expiry. Stores that don't
-   * implement this method silently lose TTL semantics — callers (e.g.
-   * {@link SharedMemory}) should fall back to {@link set} and not enforce
-   * expiry on entries from those backends.
+   * 可选方法：带过期回合的存储
+   * 不支持此方法的存储库会静默丢失 TTL 过期功能
+   * 调用方（如 SharedMemory）会自动降级使用 set 方法，不会强制后端处理过期
    */
   setWithExpiry?(
     key: string,
@@ -1049,8 +1052,14 @@ export interface MemoryStore {
     expiresAtTurn: number,
     metadata?: Record<string, unknown>,
   ): Promise<void>
+
+  // 列出所有存储的条目
   list(): Promise<MemoryEntry[]>
+
+  // 删除指定 key
   delete(key: string): Promise<void>
+
+  // 清空所有数据
   clear(): Promise<void>
 }
 

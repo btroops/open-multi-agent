@@ -1,25 +1,32 @@
 /**
- * @fileoverview In-memory implementation of {@link MemoryStore}.
+ * @fileoverview MemoryStore 接口的内存实现（InMemoryStore）
  *
- * All data lives in a plain `Map` and is never persisted to disk. This is the
- * default store used by {@link SharedMemory} and is suitable for testing and
- * single-process use-cases. Swap it for a Redis or SQLite-backed implementation
- * in production by satisfying the same {@link MemoryStore} interface.
+ * 所有数据都存储在原生的 Map 对象中，**不会持久化到磁盘**。
+ * 这是 SharedMemory 类默认使用的存储引擎，适用于：
+ * 1. 单元测试 / 集成测试
+ * 2. 单进程、单机运行的场景
+ *
+ * 生产环境可以替换为 Redis、SQLite、PostgreSQL 等实现，
+ * 只需要实现相同的 MemoryStore 接口即可，上层代码无需修改。
  */
 
 import type { MemoryEntry, MemoryStore } from '../types.js'
 
 // ---------------------------------------------------------------------------
-// InMemoryStore
+// InMemoryStore 核心类实现
 // ---------------------------------------------------------------------------
 
 /**
- * Synchronous-under-the-hood key/value store that exposes an `async` surface
- * so implementations can be swapped for async-native backends without changing
- * callers.
+ * 底层同步执行、对外暴露异步接口的键值存储
  *
- * All keys are treated as opaque strings. Values are always strings; structured
- * data must be serialised by the caller (e.g. `JSON.stringify`).
+ * 设计目的：
+ * 虽然本实现是内存同步操作，但对外提供 async/await 异步接口，
+ * 这样未来替换成 Redis/DB 等真正的异步后端时，**调用方代码完全不用修改**，
+ * 保证了存储层的可替换性、架构灵活性。
+ *
+ * 数据规范：
+ * - 所有键都当作不透明字符串处理（不解析、不修改）
+ * - 所有值都必须是字符串；结构化数据必须由调用方提前序列化（如 JSON.stringify）
  *
  * @example
  * ```ts
@@ -29,44 +36,67 @@ import type { MemoryEntry, MemoryStore } from '../types.js'
  * ```
  */
 export class InMemoryStore implements MemoryStore {
+  /**
+   * 底层真正存储数据的容器
+   * 使用 JS 原生 Map：
+   * key = 字符串键（如 agent1/key1）
+   * value = MemoryEntry 完整数据对象（包含值、元数据、创建时间、过期回合等）
+   * private 保证外部无法直接操作，只能通过类方法访问，保证数据安全
+   */
   private readonly data = new Map<string, MemoryEntry>()
 
   // ---------------------------------------------------------------------------
-  // MemoryStore interface
+  // 实现 MemoryStore 标准接口（必须实现的 5 个核心方法）
   // ---------------------------------------------------------------------------
 
-  /** Returns the entry for `key`, or `null` if not present. */
+  /**
+   * 根据键获取一条数据
+   * @param key - 要查询的完整键名
+   * @returns 存在则返回 MemoryEntry 对象，不存在返回 null
+   */
   async get(key: string): Promise<MemoryEntry | null> {
+    // 从 Map 中获取，不存在则返回 null
     return this.data.get(key) ?? null
   }
 
   /**
-   * Upserts `key` with `value` and optional `metadata`.
+   * 设置/更新一条数据（无过期时间）
+   * 行为：键不存在则新增，存在则覆盖 value/metadata，但保留原始 createdAt
    *
-   * If the key already exists its `createdAt` is **preserved** so callers can
-   * detect when a value was first written.
+   * @param key - 键名
+   * @param value - 要存储的字符串值
+   * @param metadata - 可选元数据（对象）
    */
   async set(
     key: string,
     value: string,
     metadata?: Record<string, unknown>,
   ): Promise<void> {
+    // 先查询是否已存在该键，用于保留创建时间
     const existing = this.data.get(key)
+
+    // 构建要存入的 MemoryEntry 对象
     const entry: MemoryEntry = {
-      key,
-      value,
+      key,                  // 键名
+      value,                // 数据值
+      // 有元数据则复制一份新对象，没有则设为 undefined（节省空间）
       metadata: metadata !== undefined ? { ...metadata } : undefined,
+      // 关键设计：已存在则保留创建时间，不存在则新建时间
       createdAt: existing?.createdAt ?? new Date(),
     }
+
+    // 写入 Map 覆盖/新增
     this.data.set(key, entry)
   }
 
   /**
-   * Like {@link set}, but also records a turn-count expiry. The entry is
-   * stored as-is — expiry filtering is the caller's responsibility (typically
-   * {@link SharedMemory}, which owns the turn counter).
+   * 设置/更新一条**带回合过期**的数据
+   * 与 set 方法逻辑几乎一致，只是多了 expiresAtTurn 过期回合字段
    *
-   * `createdAt` is preserved on update, matching {@link set}.
+   * @param key - 键名
+   * @param value - 数据值
+   * @param expiresAtTurn - 过期回合数（到该回合自动失效）
+   * @param metadata - 可选元数据
    */
   async setWithExpiry(
     key: string,
@@ -74,74 +104,106 @@ export class InMemoryStore implements MemoryStore {
     expiresAtTurn: number,
     metadata?: Record<string, unknown>,
   ): Promise<void> {
+    // 查询是否已存在，保留创建时间
     const existing = this.data.get(key)
+
+    // 构建带过期回合的条目
     const entry: MemoryEntry = {
       key,
       value,
       metadata: metadata !== undefined ? { ...metadata } : undefined,
       createdAt: existing?.createdAt ?? new Date(),
-      expiresAtTurn,
+      expiresAtTurn, // 唯一区别：记录过期回合
     }
+
     this.data.set(key, entry)
   }
 
-  /** Returns a snapshot of all entries in insertion order. */
+  /**
+   * 获取存储中**所有**数据条目
+   * @returns 按插入顺序排列的条目数组（Map 特性）
+   * 注意：返回的是快照，瞬间状态，不自动过滤过期数据
+   * 过期过滤由上层 SharedMemory 负责
+   */
   async list(): Promise<MemoryEntry[]> {
+    // Map.values() 转成数组返回
     return Array.from(this.data.values())
   }
 
   /**
-   * Removes the entry for `key`.
-   * Deleting a non-existent key is a no-op.
+   * 删除指定键的数据
+   * @param key - 要删除的键
+   * 行为：键不存在也不会报错，静默忽略
    */
   async delete(key: string): Promise<void> {
     this.data.delete(key)
   }
 
-  /** Removes **all** entries from the store. */
+  /**
+   * 清空整个存储（删除所有数据）
+   * 常用于测试重置、会话清空等场景
+   */
   async clear(): Promise<void> {
     this.data.clear()
   }
 
   // ---------------------------------------------------------------------------
-  // Extensions beyond the base MemoryStore interface
+  // 扩展方法：不属于标准 MemoryStore 接口，是内存存储的增强功能
   // ---------------------------------------------------------------------------
 
   /**
-   * Returns entries whose `key` starts with `query` **or** whose `value`
-   * contains `query` (case-insensitive substring match).
+   * 简单搜索功能：根据关键词模糊查询
+   * 匹配规则（不区分大小写）：
+   * 1. 键名包含关键词
+   * 2. 数据值包含关键词
+   * 满足任一即返回
    *
-   * This is a simple linear scan; it is not suitable for very large stores
-   * without an index layer on top.
+   * 性能：线性全量扫描，适合小数据量
+   * 大数据量需要加索引或使用专业数据库
+   *
+   * @param query - 搜索关键词
+   * @returns 匹配的条目数组
    *
    * @example
    * ```ts
-   * // Find all entries related to "research"
+   * // 查找所有包含 "research" 的数据
    * const hits = await store.search('research')
    * ```
    */
   async search(query: string): Promise<MemoryEntry[]> {
+    // 空查询 = 返回全部数据
     if (query.length === 0) {
       return this.list()
     }
-    const lower = query.toLowerCase()
+
+    // 统一转小写，实现不区分大小写匹配
+    const lowerQuery = query.toLowerCase()
+
+    // 过滤出键或值包含关键词的条目
     return Array.from(this.data.values()).filter(
       (entry) =>
-        entry.key.toLowerCase().includes(lower) ||
-        entry.value.toLowerCase().includes(lower),
+        entry.key.toLowerCase().includes(lowerQuery) ||
+        entry.value.toLowerCase().includes(lowerQuery),
     )
   }
 
   // ---------------------------------------------------------------------------
-  // Convenience helpers (not part of MemoryStore)
+  // 便捷工具方法：不属于 MemoryStore 接口，方便使用
   // ---------------------------------------------------------------------------
 
-  /** Returns the number of entries currently held in the store. */
+  /**
+   * 获取当前存储的条目数量
+   * getter 属性，使用方式：store.size
+   */
   get size(): number {
     return this.data.size
   }
 
-  /** Returns `true` if `key` exists in the store. */
+  /**
+   * 判断某个键是否存在（不读取值，效率更高）
+   * @param key - 要检查的键
+   * @returns 存在返回 true，不存在 false
+   */
   has(key: string): boolean {
     return this.data.has(key)
   }
