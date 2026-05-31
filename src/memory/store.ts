@@ -48,7 +48,7 @@ export class InMemoryStore implements MemoryStore {
    */
   async set(
     key: string,
-    value: string,
+    value: unknown,
     metadata?: Record<string, unknown>,
   ): Promise<void> {
     const existing = this.data.get(key)
@@ -70,7 +70,7 @@ export class InMemoryStore implements MemoryStore {
    */
   async setWithExpiry(
     key: string,
-    value: string,
+    value: unknown,
     expiresAtTurn: number,
     metadata?: Record<string, unknown>,
   ): Promise<void> {
@@ -128,7 +128,7 @@ export class InMemoryStore implements MemoryStore {
     return Array.from(this.data.values()).filter(
       (entry) =>
         entry.key.toLowerCase().includes(lower) ||
-        entry.value.toLowerCase().includes(lower),
+        (typeof entry.value === 'string' && entry.value.toLowerCase().includes(lower)),
     )
   }
 

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { z } from 'zod'
 import { SharedMemory } from '../src/memory/shared.js'
 import { Team } from '../src/team/team.js'
 import type { MemoryEntry, MemoryStore } from '../src/types.js'
@@ -402,6 +403,187 @@ describe('SharedMemory', () => {
       // ...but the underlying store still has it (didn't get deleted).
       expect(await store.get('alice/gone')).not.toBeNull()
       expect(await store.list()).toHaveLength(1)
+    })
+  })
+
+  describe('structured values (typed handoff)', () => {
+    it('writes and reads a plain object', async () => {
+      const mem = new SharedMemory()
+      const data = { total: 42, passed: 40, failed: 2 }
+      await mem.write('analyst', 'summary', data)
+
+      const entry = await mem.read('analyst/summary')
+      expect(entry).not.toBeNull()
+      expect(entry!.value).toEqual(data)
+    })
+
+    it('writes and reads an array', async () => {
+      const mem = new SharedMemory()
+      const data = [
+        { id: 1, status: 'pass' },
+        { id: 2, status: 'fail' },
+      ]
+      await mem.write('tester', 'reports', data)
+
+      const entry = await mem.read('tester/reports')
+      expect(entry).not.toBeNull()
+      expect(entry!.value).toEqual(data)
+    })
+
+    it('writes and reads a number', async () => {
+      const mem = new SharedMemory()
+      await mem.write('counter', 'remaining', 7)
+
+      const entry = await mem.read('counter/remaining')
+      expect(entry).not.toBeNull()
+      expect(entry!.value).toBe(7)
+    })
+
+    it('writes and reads a boolean', async () => {
+      const mem = new SharedMemory()
+      await mem.write('checker', 'valid', true)
+
+      const entry = await mem.read('checker/valid')
+      expect(entry).not.toBeNull()
+      expect(entry!.value).toBe(true)
+    })
+
+    it('writes and reads null', async () => {
+      const mem = new SharedMemory()
+      await mem.write('agent', 'nullable', null)
+
+      const entry = await mem.read('agent/nullable')
+      expect(entry).not.toBeNull()
+      expect(entry!.value).toBeNull()
+    })
+
+    it('preserves backward compatibility with plain strings', async () => {
+      const mem = new SharedMemory()
+      await mem.write('researcher', 'findings', 'TS 5.5 ships const type params')
+
+      const entry = await mem.read('researcher/findings')
+      expect(entry).not.toBeNull()
+      expect(entry!.value).toBe('TS 5.5 ships const type params')
+    })
+
+    it('overwrites a structured value preserving createdAt', async () => {
+      const mem = new SharedMemory()
+      await mem.write('agent', 'key', { first: true })
+      const first = await mem.read('agent/key')
+
+      await mem.write('agent', 'key', { second: true })
+      const second = await mem.read('agent/key')
+
+      expect(second!.value).toEqual({ second: true })
+      expect(second!.createdAt.getTime()).toBe(first!.createdAt.getTime())
+    })
+
+    it('getSummary shows pretty-printed JSON for objects', async () => {
+      const mem = new SharedMemory()
+      await mem.write('analyst', 'stats', { pass: 40, fail: 2 })
+
+      const summary = await mem.getSummary()
+      expect(summary).toContain('"pass": 40')
+      expect(summary).toContain('"fail": 2')
+    })
+
+    it('getSummary shows number values inline', async () => {
+      const mem = new SharedMemory()
+      await mem.write('counter', 'remaining', 7)
+
+      const summary = await mem.getSummary()
+      expect(summary).toContain('remaining: 7')
+    })
+
+    it('getSummary shows boolean values inline', async () => {
+      const mem = new SharedMemory()
+      await mem.write('checker', 'valid', true)
+
+      const summary = await mem.getSummary()
+      expect(summary).toContain('valid: true')
+    })
+
+    it('getSummary shows null inline', async () => {
+      const mem = new SharedMemory()
+      await mem.write('agent', 'val', null)
+
+      const summary = await mem.getSummary()
+      expect(summary).toContain('val: null')
+    })
+
+    it('getSummary shows undefined inline', async () => {
+      const mem = new SharedMemory()
+      await mem.write('agent', 'val', undefined as unknown as null)
+
+      const summary = await mem.getSummary()
+      expect(summary).toContain('val: undefined')
+    })
+
+    it('getSummary truncates long object values', async () => {
+      const mem = new SharedMemory()
+      const big = { data: 'x'.repeat(300) }
+      await mem.write('agent', 'big', big)
+
+      const summary = await mem.getSummary()
+      // Should truncate the JSON string at 200 chars and add '…'
+      const line = summary.split('\n').find(l => l.startsWith('- big:'))
+      expect(line).toBeDefined()
+      expect(line!.length).toBeLessThan(350) // original JSON is ~310 chars
+    })
+
+    it('metadata is still stored alongside structured values', async () => {
+      const mem = new SharedMemory()
+      await mem.write('agent', 'key', { nested: true }, { priority: 'high' })
+
+      const entry = await mem.read('agent/key')
+      expect(entry!.value).toEqual({ nested: true })
+      expect(entry!.metadata).toMatchObject({ priority: 'high', agent: 'agent' })
+    })
+
+    describe('optional Zod schema validation', () => {
+      const MetricSchema = z.object({
+        total: z.number(),
+        passed: z.number(),
+        failed: z.number(),
+      })
+
+      it('passes validation when data matches the schema', async () => {
+        const mem = new SharedMemory()
+        const data = { total: 42, passed: 40, failed: 2 }
+
+        await expect(
+          mem.write('analyst', 'stats', data, undefined, MetricSchema),
+        ).resolves.toBeUndefined()
+        const entry = await mem.read('analyst/stats')
+        expect(entry!.value).toEqual(data)
+      })
+
+      it('rejects data that does not match the schema', async () => {
+        const mem = new SharedMemory()
+        const bad = { total: 42, passed: 40 } // missing "failed"
+
+        await expect(
+          mem.write('analyst', 'stats', bad, undefined, MetricSchema),
+        ).rejects.toThrow(z.ZodError)
+      })
+
+      it('rejects data with wrong types', async () => {
+        const mem = new SharedMemory()
+        const bad = { total: '42', passed: 40, failed: 2 }
+
+        await expect(
+          mem.write('analyst', 'stats', bad, undefined, MetricSchema),
+        ).rejects.toThrow(z.ZodError)
+      })
+
+      it('validation works with writeExpiring', async () => {
+        const mem = new SharedMemory()
+        const data = { total: 10, passed: 8, failed: 2 }
+
+        await expect(
+          mem.writeExpiring('analyst', 'stats', data, 5, undefined, MetricSchema),
+        ).resolves.toBeUndefined()
+      })
     })
   })
 })

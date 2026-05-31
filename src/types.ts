@@ -1061,7 +1061,7 @@ export type TraceEvent =
 /** A single key-value record stored in a {@link MemoryStore}. */
 export interface MemoryEntry {
   readonly key: string
-  readonly value: string
+  readonly value: unknown
   readonly metadata?: Readonly<Record<string, unknown>>
   readonly createdAt: Date
   /**
@@ -1079,7 +1079,7 @@ export interface MemoryEntry {
  */
 export interface MemoryStore {
   get(key: string): Promise<MemoryEntry | null>
-  set(key: string, value: string, metadata?: Record<string, unknown>): Promise<void>
+  set(key: string, value: unknown, metadata?: Record<string, unknown>): Promise<void>
   /**
    * Optional: write an entry with a turn-count expiry. Stores that don't
    * implement this method silently lose TTL semantics — callers (e.g.
@@ -1088,7 +1088,7 @@ export interface MemoryStore {
    */
   setWithExpiry?(
     key: string,
-    value: string,
+    value: unknown,
     expiresAtTurn: number,
     metadata?: Record<string, unknown>,
   ): Promise<void>

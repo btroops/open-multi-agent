@@ -8,6 +8,7 @@
  */
 
 import type { MemoryEntry, MemoryStore } from '../types.js'
+import type { ZodSchema } from 'zod'
 import { InMemoryStore } from './store.js'
 
 // ---------------------------------------------------------------------------
@@ -118,15 +119,23 @@ export class SharedMemory {
    *
    * @param agentName - The writing agent's name (used as a namespace prefix).
    * @param key       - Logical key within the agent's namespace.
-   * @param value     - String value to store (serialise objects before writing).
+   * @param value     - Value to store. Strings are stored as-is; other
+   *                    JSON-serializable types (objects, arrays, numbers) are
+   *                    stored directly.
    * @param metadata  - Optional extra metadata stored alongside the entry.
+   * @param schema    - Optional Zod schema to validate `value` before writing.
+   *                    Throws {@link ZodError} when validation fails.
    */
   async write(
     agentName: string,
     key: string,
-    value: string,
+    value: unknown,
     metadata?: Record<string, unknown>,
+    schema?: ZodSchema,
   ): Promise<void> {
+    if (schema) {
+      schema.parse(value)
+    }
     const namespacedKey = SharedMemory.namespaceKey(agentName, key)
     await this.store.set(namespacedKey, value, {
       ...metadata,
@@ -162,15 +171,19 @@ export class SharedMemory {
   async writeExpiring(
     agentName: string,
     key: string,
-    value: string,
+    value: unknown,
     ttlTurns: number,
     metadata?: Record<string, unknown>,
+    schema?: ZodSchema,
   ): Promise<void> {
     if (!Number.isInteger(ttlTurns) || ttlTurns < 1) {
       throw new RangeError(
         `SharedMemory.writeExpiring: ttlTurns must be an integer ≥ 1 (got ${ttlTurns}). ` +
           'Use write() for entries that should never expire.',
       )
+    }
+    if (schema) {
+      schema.parse(value)
     }
     const namespacedKey = SharedMemory.namespaceKey(agentName, key)
     const fullMetadata = { ...metadata, agent: agentName }
@@ -275,7 +288,21 @@ export class SharedMemory {
         group = []
         byAgent.set(agent, group)
       }
-      group.push({ localKey, value: entry.value })
+      let strVal: string
+      if (typeof entry.value === 'string') {
+        strVal = entry.value
+      } else if (entry.value === null || entry.value === undefined) {
+        strVal = String(entry.value) // 'null' or 'undefined'
+      } else if (typeof entry.value === 'object') {
+        try {
+          strVal = JSON.stringify(entry.value, null, 2)
+        } catch {
+          strVal ='[Circular/Unserializable Object]'
+        }
+      } else {
+        strVal = String(entry.value) // for numbers, booleans, symbols, etc.
+      }
+      group.push({ localKey, value: strVal })
     }
 
     const lines: string[] = ['## Shared Team Memory', '']
